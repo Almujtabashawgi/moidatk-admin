@@ -178,3 +178,18 @@ dialog h2 { font-size: 18px; }
 .chip.live { background: #E3F3EA; color: #1F7A4D; }
 .chip.danger { background: #FBE4E1; color: var(--danger); }
 .load-more { align-self: center; min-width: 180px; }
+
+/* تعديلات العروض المنشورة: الحالي جنب الجديد */
+.diff { width: 100%; border-collapse: collapse; font-size: 14px; }
+.diff th, .diff td { text-align: start; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--divider); }
+.diff thead th { font-size: 13px; color: var(--muted); font-weight: 600; }
+.diff tbody th { font-weight: 600; white-space: nowrap; width: 1%; }
+.diff td { white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff td.old { color: var(--muted); text-decoration: line-through; text-decoration-color: #C9C4B8; }
+.diff td.new { background: #FFF6DA; font-weight: 600; }
+.photo-label { font-size: 13px; font-weight: 600; color: var(--muted); }
+.photos a.new-photo img { outline: 3px solid var(--primary); outline-offset: -3px; }
+@media (max-width: 640px) {
+  .diff tbody th { white-space: normal; }
+}
+.diff td .ltr { white-space: nowrap; }

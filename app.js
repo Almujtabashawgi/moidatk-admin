@@ -471,6 +471,122 @@ function groupReports(rows) {
   return [...groups.values()];
 }
 
+// ---------------------------------------------------------------- تعديلات العروض المنشورة
+
+// التعديل بيستنى في listing_edits، والعرض المنشور بيفضل ظاهر زي ما هو لحدي الموافقة.
+const EDIT_QUERY = `*, item_types(name_ar), cities(name_ar), states(name_ar), listings!inner(${LISTING_QUERY})`;
+
+const yesNo = (value, yes, no) => (value === null || value === undefined ? null : value ? yes : no);
+
+const changesLabel = (n) => {
+  if (n === 0) return 'البيانات زي ما هي';
+  if (n === 1) return 'تغيير واحد';
+  if (n === 2) return 'تغييرين';
+  return n <= 10 ? `${n} تغييرات` : `${n} تغيير`;
+};
+
+/** الحقول الظاهرة للمقارنة. listings و listing_edits فيهم نفس الحقول. */
+function comparableFields(row) {
+  const isNew = row.condition === 'new';
+  return [
+    ['النوع', row.item_types?.name_ar],
+    ['بيع أو إيجار', dealLabel(row.deal)],
+    ['الماركة', row.brand],
+    ['الموديل', row.model],
+    ['السعر', priceLine(row.price, row.currency, row.price_unit)],
+    ['المكان', `${row.cities.name_ar}، ولاية ${row.states.name_ar}`],
+    ['رقم التواصل', row.contact_phone],
+    ['التواصل', [row.contact_whatsapp && 'واتساب', row.contact_call && 'اتصال'].filter(Boolean).join(' و')],
+    ['سنة الصنع', row.year],
+    ['ساعات التشغيل', isNew ? null : row.hours],
+    ['المسافة (كم)', isNew ? null : row.mileage_km],
+    ['الحمولة (طن)', row.load_tons],
+    ['الإنتاج (طن/ساعة)', row.production_tph],
+    ['قوة المحرك (حصان)', row.horsepower],
+    ['مصدر الطاقة', { diesel: 'ديزل', electric: 'كهرباء' }[row.power_source]],
+    ['التصنيع', { local: 'محلي', imported: 'مستورد' }[row.origin]],
+    ['الكمية', row.quantity],
+    ['مشغّل أو سائق', yesNo(row.with_operator, 'معاهو', 'من غيرو')],
+    ['الحالة', { new: 'جديدة', used: 'مستعملة' }[row.condition]],
+    ['الوصف', row.description],
+  ].map(([label, value]) => [label, value === null || value === undefined || value === '' ? '—' : String(value)]);
+}
+
+function photoStrip(paths, highlight = new Set()) {
+  return h('div', { class: 'photos' }, paths.map((path) => {
+    const url = photoUrl(path);
+    return h('a', { href: url, target: '_blank', rel: 'noopener noreferrer', class: highlight.has(path) ? 'new-photo' : null },
+      h('img', { src: url, alt: '', loading: 'lazy' }));
+  }));
+}
+
+/** بيمسح الصور ونسخها الصغيرة. من غير صلاحية المسح الخادم بيرجّع قائمة فاضية. */
+async function removePhotoFiles(paths) {
+  if (!paths.length) return true;
+  const { data, error } = await db.storage.from('listing-photos').remove([...paths, ...paths.map(thumbPath)]);
+  return !error && (data?.length ?? 0) >= paths.length;
+}
+
+function editCard(edit, reload) {
+  const listing = edit.listings;
+  const livePhotos = [...listing.listing_photos]
+    .sort((a, b) => a.position - b.position)
+    .map((photo) => photo.storage_path);
+  const before = comparableFields(listing);
+  const changes = comparableFields(edit)
+    .map(([label, value], i) => [label, before[i][1], value])
+    .filter(([, old, value]) => old !== value);
+  const photosChanged = livePhotos.join('|') !== edit.photos.join('|');
+  // الصور الجديدة بس: بتتمسح لو التعديل اترفض.
+  const newPhotos = new Set(edit.photos.filter((path) => !livePhotos.includes(path)));
+  const cell = (label, value, className) =>
+    h('td', { class: className }, label === 'رقم التواصل' && value !== '—' ? phoneText(value) : value);
+
+  const approve = actionButton('قبول التعديل', 'dark', async () => {
+    const unused = await must(db.rpc('approve_listing_edit', { p_listing_id: edit.listing_id }));
+    const cleaned = await removePhotoFiles(unused || []);
+    toast(cleaned
+      ? 'التعديل اتطبّق، والعرض ظاهر بيهو في التطبيق'
+      : 'التعديل اتطبّق، لكن الصور القديمة ما اتمسحت. شغّل ملف 20261106120000_admin_moderation.sql');
+    reload();
+  });
+  const reject = actionButton('رفض التعديل', '', async () => {
+    const reason = await askReason('رفض التعديل');
+    if (!reason) return;
+    await mustUpdate(db.from('listing_edits')
+      .update({ status: 'rejected', reject_reason: reason })
+      .eq('listing_id', edit.listing_id), 'listing_id');
+    await removePhotoFiles([...newPhotos]);
+    toast('اترفض، والعرض فضل زي ما كان. السبب ظاهر لصاحبو');
+    reload();
+  });
+
+  return h('div', { class: 'card' },
+    h('div', { class: 'card-row' },
+      h('img', { class: 'thumb', src: photoUrl(edit.photos[0]), alt: '' }),
+      h('div', { class: 'card-text' },
+        h('div', { class: 'card-title' }, `${listingTitle(listing)} · ${dealLabel(listing.deal)}`),
+        h('div', { class: 'card-meta' },
+          `${ownerLine(listing.profiles)} · اتعدّل ${date.format(new Date(edit.updated_at))} · `
+          + `${changesLabel(changes.length)}${photosChanged ? ' والصور' : ''}`)),
+      h('div', { class: 'actions' }, approve, reject)),
+    h('div', { class: 'details' },
+      changes.length
+        ? h('table', { class: 'diff' },
+          h('thead', {}, h('tr', {}, h('th', {}, 'الحقل'), h('th', {}, 'الحالي (ظاهر للناس)'), h('th', {}, 'بعد التعديل'))),
+          h('tbody', {}, changes.map(([label, old, value]) =>
+            h('tr', {}, h('th', {}, label), cell(label, old, 'old'), cell(label, value, 'new')))))
+        : null,
+      photosChanged
+        ? [
+          h('div', { class: 'photo-label' }, 'الصور الحالية'),
+          photoStrip(livePhotos),
+          h('div', { class: 'photo-label' }, 'الصور بعد التعديل (الجديدة عليها إطار)'),
+          photoStrip(edit.photos, newPhotos),
+        ]
+        : null));
+}
+
 async function count(table, column, value) {
   const { count: total, error } = await db.from(table)
     .select('id', { count: 'exact', head: true })
@@ -481,8 +597,14 @@ async function count(table, column, value) {
 
 async function listingsTab(main) {
   const reload = () => showPanel('listings');
-  const [listings, requests, reports, published] = await Promise.all([
+  const [listings, edits, requests, reports, published] = await Promise.all([
     must(db.from('listings').select(LISTING_QUERY).eq('status', 'pending').order('created_at')),
+    // null لو ملف listing_edits لسه ما اتشغّل، عشان باقي الصفحة يفتح.
+    db.from('listing_edits').select(EDIT_QUERY)
+      .eq('status', 'pending')
+      .eq('listings.status', 'published')
+      .order('updated_at')
+      .then(({ data, error }) => (error ? null : data)),
     must(db.from('buyer_requests').select(REQUEST_QUERY).eq('status', 'pending').order('created_at')),
     must(db.from('reports')
       .select('id, reason, listing_id, request_id, listings(id, brand, model, deal, item_types(name_ar)), buyer_requests(id, deal, item_types(name_ar))')
@@ -501,11 +623,18 @@ async function listingsTab(main) {
     h('div', { class: 'stats' },
       stat('عروض منشورة', published),
       stat('عروض قيد المراجعة', listings.length),
+      stat('تعديلات قيد المراجعة', edits ? edits.length : '—'),
       stat('طلبات قيد المراجعة', requests.length),
       stat('بلاغات مفتوحة', reports.length)),
     h('section', {},
       h('h2', {}, 'عروض قيد المراجعة'),
       list(listings, (row) => listingCard(row, reload), 'ما في عروض منتظرة.')),
+    h('section', {},
+      h('h2', {}, 'تعديلات على عروض منشورة'),
+      h('p', { class: 'hint' }, 'العرض بيفضل ظاهر بالنسخة الحالية لحدي ما توافق على التعديل.'),
+      edits
+        ? list(edits, (edit) => editCard(edit, reload), 'ما في تعديلات منتظرة.')
+        : h('p', { class: 'empty' }, 'التعديلات محتاجة ملف 20261106130000_listing_edits.sql يتشغّل في Supabase.')),
     h('section', {},
       h('h2', {}, 'طلبات قيد المراجعة'),
       list(requests, (row) => requestCard(row, reload), 'ما في طلبات منتظرة.')),
@@ -593,13 +722,11 @@ function confirmDialog(title, message, confirmLabel) {
 
 /** الحذف بيمسح العرض أول (وصورو وبلاغاتو والمفضلة بتتمسح معاهو)، وبعدها ملفات الصور. */
 async function deleteListing(row) {
+  // صور التعديل المنتظر (لو في) بتتمسح كمان. التعديل نفسو بيتمسح مع العرض.
+  const { data: edit } = await db.from('listing_edits').select('photos').eq('listing_id', row.id).maybeSingle();
   await mustUpdate(db.from('listings').delete().eq('id', row.id));
-  const photos = row.listing_photos.map((photo) => photo.storage_path);
-  if (!photos.length) return true;
-  const { data, error } = await db.storage.from('listing-photos')
-    .remove([...photos, ...photos.map(thumbPath)]);
-  // من غير صلاحية مسح الملفات، الخادم بيرجّع قائمة فاضية من غير خطأ.
-  return !error && (data?.length ?? 0) >= photos.length;
+  const photos = [...new Set([...row.listing_photos.map((photo) => photo.storage_path), ...(edit?.photos || [])])];
+  return removePhotoFiles(photos);
 }
 
 function manageListingCard(row, reload) {
