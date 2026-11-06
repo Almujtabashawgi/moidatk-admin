@@ -291,7 +291,7 @@ function showPanel(tab) {
   });
 }
 
-function askReason(title) {
+function askReason(title, { confirmLabel = 'رفض', label = 'السبب (بيظهر لصاحبو في التطبيق)' } = {}) {
   return new Promise((resolve) => {
     const reason = h('textarea', { rows: 3, maxlength: 500, required: true });
     const dialog = h('dialog', {},
@@ -306,9 +306,9 @@ function askReason(title) {
         },
       },
         h('h2', {}, title),
-        h('label', { class: 'field' }, 'السبب (بيظهر لصاحبو في التطبيق)', reason),
+        h('label', { class: 'field' }, label, reason),
         h('div', { class: 'actions' },
-          h('button', { class: 'btn dark', type: 'submit' }, 'رفض'),
+          h('button', { class: 'btn dark', type: 'submit' }, confirmLabel),
           h('button', {
             class: 'btn',
             type: 'button',
@@ -714,7 +714,8 @@ function confirmDialog(title, message, confirmLabel) {
         h('p', { class: 'hint' }, message),
         h('div', { class: 'actions' },
           h('button', { class: 'btn danger', type: 'submit' }, confirmLabel),
-          h('button', { class: 'btn', type: 'button', onClick: () => finish(false) }, 'إلغاء'))));
+          // المؤشر على «إلغاء»، عشان Enter ما يمسح حاجة بالغلط.
+          h('button', { class: 'btn', type: 'button', autofocus: true, onClick: () => finish(false) }, 'إلغاء'))));
     document.body.append(dialog);
     dialog.showModal();
   });
@@ -897,7 +898,64 @@ const phoneText = (phone) => h('span', { class: 'ltr', style: 'display:inline-bl
 
 // ---------------------------------------------------------------- الشركات والإعدادات
 
-function userCard(user, packages, reload) {
+/** دوال الإدارة بترمي رموز قصيرة، ودي معناها بالعربي. */
+async function adminRpc(name, params) {
+  const { data, error } = await db.rpc(name, params);
+  if (error?.message === 'admin_account') throw new Error('حساب الإدارة ما بيتوقف ولا بينمسح من هنا');
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * [suspension] صف من suspended_users لو الحساب موقوف. [canControl] false لو ملف
+ * 20261106140000_account_control.sql لسه ما اتشغّل، فأزرار الإيقاف والحذف ما بتظهر.
+ */
+function accountActions(user, suspension, canControl, reload) {
+  if (!canControl) return [];
+  const name = user.name || 'من غير اسم';
+
+  const suspend = suspension
+    ? actionButton('إلغاء الإيقاف', '', async () => {
+      await adminRpc('admin_unsuspend_user', { p_user_id: user.id });
+      toast('الحساب رجع، وعروضو ظاهرة للناس تاني');
+      reload();
+    })
+    : actionButton('إيقاف', '', async () => {
+      const reason = await askReason(`إيقاف حساب «${name}»`, {
+        confirmLabel: 'إيقاف',
+        label: 'السبب (للإدارة بس). الحساب ما بيقدر ينشر أو يعدّل، وعروضو وطلباتو بتختفي من الناس لحدي ما تلغي الإيقاف.',
+      });
+      if (!reason) return;
+      await adminRpc('admin_suspend_user', { p_user_id: user.id, p_reason: reason });
+      toast('الحساب اتوقف، وعروضو اختفت من التطبيق');
+      reload();
+    });
+
+  const remove = actionButton('حذف الحساب', 'danger', async () => {
+    const confirmed = await confirmDialog(
+      `حذف حساب «${name}»`,
+      `بيتمسح الحساب وكل عروضو (${number.format(user.listing_count)}) وطلباتو وصورو ورصيدو نهائياً، وما بيرجع. لو عايز توقفو بس، استعمل «إيقاف».`,
+      'حذف نهائي',
+    );
+    if (!confirmed) return;
+    const files = await adminRpc('admin_delete_user', { p_user_id: user.id });
+    const photosRemoved = await removePhotoFiles(files?.listing_photos || []);
+    const media = files?.media || [];
+    let mediaRemoved = true;
+    if (media.length) {
+      const { data, error } = await db.storage.from('company-media').remove(media);
+      mediaRemoved = !error && (data?.length ?? 0) >= media.length;
+    }
+    toast(photosRemoved && mediaRemoved
+      ? 'الحساب اتمسح مع كل بياناتو وصورو'
+      : 'الحساب اتمسح، لكن بعض الصور ما اتمسحت من التخزين');
+    reload();
+  });
+
+  return [suspend, remove];
+}
+
+function userCard(user, packages, reload, suspension = null, canControl = false) {
   const setVerified = async (verified) => {
     await mustUpdate(db.from('profiles')
       .update({ verified, company_page_status: 'approved' })
@@ -914,19 +972,26 @@ function userCard(user, packages, reload) {
         ? h('span', { class: 'chip verified' }, 'شركة موثّقة')
         : h('span', { class: 'chip' }, 'غير موثّقة');
 
-  return h('div', { class: 'card' },
+  return h('div', { class: `card${suspension ? ' suspended' : ''}` },
     h('div', { class: 'card-row' },
       h('div', { class: 'card-text' },
         h('div', { class: 'card-title' }, user.name || 'من غير اسم'),
         h('div', { class: 'card-meta' },
           `${user.is_company ? 'شركة' : 'فرد'} · `,
           h('span', { class: 'ltr', style: 'display:inline-block' }, user.phone ? `+${user.phone}` : user.email || 'من غير رقم'),
-          ` · ${number.format(user.listing_count)} عروض · رصيد ${number.format(user.ads_balance)}${user.featured_balance ? ` + ${number.format(user.featured_balance)} مميزة` : ''}`)),
+          ` · ${number.format(user.listing_count)} عروض · رصيد ${number.format(user.ads_balance)}${user.featured_balance ? ` + ${number.format(user.featured_balance)} مميزة` : ''}`),
+        suspension
+          ? h('div', { class: 'card-meta danger-text' },
+            `موقوف من ${date.format(new Date(suspension.suspended_at))}: ${suspension.reason}`)
+          : null),
+      suspension ? h('span', { class: 'chip danger' }, 'موقوف') : null,
       chip,
-      h('button', { class: 'btn', onClick: () => showGrantDialog(user, packages, reload) }, 'إضافة رصيد'),
-      user.is_company && (user.verified
-        ? actionButton('إلغاء التوثيق', '', () => setVerified(false))
-        : actionButton('توثيق', 'blue', () => setVerified(true)))));
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn', onClick: () => showGrantDialog(user, packages, reload) }, 'إضافة رصيد'),
+        user.is_company && (user.verified
+          ? actionButton('إلغاء التوثيق', '', () => setVerified(false))
+          : actionButton('توثيق', 'blue', () => setVerified(true))),
+        accountActions(user, suspension, canControl, reload))));
 }
 
 function supportCard(setting) {
@@ -956,11 +1021,18 @@ function supportCard(setting) {
 
 async function usersTab(main) {
   const reload = () => showPanel('users');
-  const [users, packages, support] = await Promise.all([
+  const [users, packages, support, suspended] = await Promise.all([
     must(db.rpc('admin_users')),
     must(db.from('ad_packages').select('*').eq('is_active', true).order('sort_order', { ascending: true })),
     must(db.from('app_settings').select('value').eq('key', 'support').single()),
+    // null لو ملف account_control لسه ما اتشغّل، عشان الصفحة تفتح عادي.
+    db.from('suspended_users').select('user_id, reason, suspended_at')
+      .then(({ data, error }) => (error ? null : data)),
   ]);
+  const canControl = suspended !== null;
+  const suspensions = new Map((suspended || []).map((row) => [row.user_id, row]));
+  const filters = h('div', { class: 'filters' });
+  let onlySuspended = false;
 
   const list = h('section', {});
   const search = h('input', {
@@ -974,17 +1046,30 @@ async function usersTab(main) {
   function render() {
     const query = search.value.trim().toLowerCase();
     const matches = users.filter((user) =>
-      (user.name || '').toLowerCase().includes(query)
-        || (user.email || '').toLowerCase().includes(query)
-        || (user.phone || '').includes(query.replace(/\D/g, '') || query));
+      (!onlySuspended || suspensions.has(user.id))
+        && ((user.name || '').toLowerCase().includes(query)
+          || (user.email || '').toLowerCase().includes(query)
+          || (user.phone || '').includes(query.replace(/\D/g, '') || query)));
     list.replaceChildren(...(matches.length
-      ? matches.map((user) => userCard(user, packages, reload))
-      : [h('p', { class: 'empty' }, 'ما لقينا مستخدم.')]));
+      ? matches.map((user) => userCard(user, packages, reload, suspensions.get(user.id) || null, canControl))
+      : [h('p', { class: 'empty' }, onlySuspended ? 'ما في حسابات موقوفة.' : 'ما لقينا مستخدم.')]));
+    filters.replaceChildren(
+      ...[[false, 'الكل', users.length], [true, 'الموقوفين', suspensions.size]].map(([value, label, total]) =>
+        h('button', {
+          class: `filter${onlySuspended === value ? ' active' : ''}`,
+          onClick: () => {
+            onlySuspended = value;
+            render();
+          },
+        }, label, h('span', {}, number.format(total)))));
   }
   render();
 
   main.replaceChildren(
     h('div', { class: 'title-row' }, h('h1', {}, 'المستخدمين والشركات'), search),
+    canControl
+      ? filters
+      : h('p', { class: 'hint' }, 'الإيقاف والحذف محتاجين ملف 20261106140000_account_control.sql يتشغّل في Supabase.'),
     list,
     h('section', {},
       h('h2', {}, 'الإعدادات'),

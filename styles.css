@@ -193,3 +193,7 @@ dialog h2 { font-size: 18px; }
   .diff tbody th { white-space: normal; }
 }
 .diff td .ltr { white-space: nowrap; }
+
+/* الحسابات الموقوفة */
+.card.suspended { border-color: #E9B8AE; background: #FFFBFA; }
+.card-meta.danger-text { color: var(--danger); }
