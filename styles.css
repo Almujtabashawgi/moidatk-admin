@@ -166,3 +166,15 @@ dialog h2 { font-size: 18px; }
   font-size: 14px;
   z-index: 10;
 }
+
+/* إدارة المنشور */
+.filters { display: flex; flex-wrap: wrap; gap: 8px; }
+.filter { min-height: 44px; padding: 0 16px; border-radius: 999px; border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; }
+.filter.light { font-weight: 600; }
+.filter.active { border-color: var(--text); background: var(--text); color: #fff; }
+.filter span { margin-inline-start: 8px; font-weight: 400; opacity: .75; }
+.search-form { display: flex; flex: 0 1 420px; gap: 8px; }
+.search-form .search { flex: 1 1 auto; }
+.chip.live { background: #E3F3EA; color: #1F7A4D; }
+.chip.danger { background: #FBE4E1; color: var(--danger); }
+.load-more { align-self: center; min-width: 180px; }

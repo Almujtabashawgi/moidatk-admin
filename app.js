@@ -278,12 +278,13 @@ function showPanel(tab) {
         brand(),
         h('nav', {},
           tabButton('listings', 'العروض والبلاغات'),
+          tabButton('manage', 'إدارة المنشور'),
           tabButton('users', 'الشركات والإعدادات'),
           tabButton('packages', 'الباقات والنشر'),
           h('button', { class: 'tab plain', onClick: signOut }, 'خروج')))),
     main);
 
-  const load = { listings: listingsTab, users: usersTab, packages: packagesTab }[tab];
+  const load = { listings: listingsTab, manage: manageTab, users: usersTab, packages: packagesTab }[tab];
   load(main).catch((error) => {
     failed(error);
     main.replaceChildren(h('p', { class: 'empty' }, 'ما قدرنا نجيب البيانات.'));
@@ -361,8 +362,9 @@ function listingSpecs(row) {
     ['رقم التواصل', row.contact_phone],
     ['التواصل', [row.contact_whatsapp && 'واتساب', row.contact_call && 'اتصال'].filter(Boolean).join(' و')],
     ['سنة الصنع', row.year],
-    ['ساعات التشغيل', row.hours],
-    ['المسافة (كم)', row.mileage_km],
+    // المعدة الجديدة ما عندها ساعات ولا مسافة
+    ['ساعات التشغيل', row.condition === 'new' ? null : row.hours],
+    ['المسافة (كم)', row.condition === 'new' ? null : row.mileage_km],
     ['الحمولة (طن)', row.load_tons],
     ['الإنتاج (طن/ساعة)', row.production_tph],
     ['قوة المحرك (حصان)', row.horsepower],
@@ -511,6 +513,260 @@ async function listingsTab(main) {
       h('h2', {}, 'البلاغات'),
       list(groups, (group) => reportCard(group, reload), 'ما في بلاغات مفتوحة.')));
 }
+
+// ---------------------------------------------------------------- إدارة المنشور
+
+const PAGE_SIZE = 30;
+const thumbPath = (path) => path.replace(/\.jpg$/, '_thumb.jpg');
+
+// [المفتاح، الاسم، الفلتر]. now بيتحسب مرة واحدة لكل تحميل.
+const LISTING_FILTERS = [
+  ['live', 'منشورة', (query, now) => query.eq('status', 'published').gt('expires_at', now)],
+  ['expired', 'منتهية', (query, now) => query.eq('status', 'published').lte('expires_at', now)],
+  ['closed', 'تم البيع أو التأجير', (query) => query.in('status', ['sold', 'rented'])],
+  ['hidden', 'مخفية', (query) => query.eq('status', 'hidden')],
+  ['rejected', 'مرفوضة', (query) => query.eq('status', 'rejected')],
+];
+const REQUEST_FILTERS = [
+  ['live', 'منشورة', (query, now) => query.eq('status', 'published').gt('expires_at', now)],
+  ['expired', 'منتهية', (query, now) => query.eq('status', 'published').lte('expires_at', now)],
+  ['closed', 'لقيتو', (query) => query.eq('status', 'found')],
+  ['hidden', 'مخفية', (query) => query.eq('status', 'hidden')],
+  ['rejected', 'مرفوضة', (query) => query.eq('status', 'rejected')],
+];
+
+// بيفضل محفوظ لما الصفحة تتحدّث بعد أي عملية.
+const manageState = { kind: 'listings', filter: 'live', search: '', loaded: PAGE_SIZE };
+
+const STATUS_LABEL = {
+  published: ['منشور', 'live'],
+  sold: ['تم البيع', ''],
+  rented: ['تم التأجير', ''],
+  found: ['لقيتو', ''],
+  hidden: ['مخفي', 'danger'],
+  rejected: ['مرفوض', 'danger'],
+  pending: ['قيد المراجعة', 'pending'],
+};
+
+function statusChip(row) {
+  const expired = row.status === 'published' && row.expires_at && new Date(row.expires_at) <= new Date();
+  const [label, tone] = expired ? ['منتهي', 'pending'] : (STATUS_LABEL[row.status] || [row.status, '']);
+  return h('span', { class: `chip ${tone}` }, label);
+}
+
+/**
+ * البحث بيتبعت للخادم. بنشيل الرموز البتلخبط فلتر «أو»، والرقم بيتبحث من غير الصفر الأول
+ * عشان 0912… و +249912… يلقوا نفس العرض.
+ */
+function searchFilter(text, columns) {
+  const clean = text.replace(/[%,()"*\\]/g, ' ').trim();
+  if (!clean) return null;
+  const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
+  const parts = columns.map((column) => `${column}.ilike."%${clean}%"`);
+  if (digits.length >= 4) parts.push(`contact_phone.ilike."%${digits}%"`);
+  return parts.join(',');
+}
+
+function confirmDialog(title, message, confirmLabel) {
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      dialog.close();
+      dialog.remove();
+      resolve(value);
+    };
+    const dialog = h('dialog', {},
+      h('form', {
+        onSubmit: (event) => {
+          event.preventDefault();
+          finish(true);
+        },
+      },
+        h('h2', {}, title),
+        h('p', { class: 'hint' }, message),
+        h('div', { class: 'actions' },
+          h('button', { class: 'btn danger', type: 'submit' }, confirmLabel),
+          h('button', { class: 'btn', type: 'button', onClick: () => finish(false) }, 'إلغاء'))));
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+
+/** الحذف بيمسح العرض أول (وصورو وبلاغاتو والمفضلة بتتمسح معاهو)، وبعدها ملفات الصور. */
+async function deleteListing(row) {
+  await mustUpdate(db.from('listings').delete().eq('id', row.id));
+  const photos = row.listing_photos.map((photo) => photo.storage_path);
+  if (!photos.length) return true;
+  const { data, error } = await db.storage.from('listing-photos')
+    .remove([...photos, ...photos.map(thumbPath)]);
+  // من غير صلاحية مسح الملفات، الخادم بيرجّع قائمة فاضية من غير خطأ.
+  return !error && (data?.length ?? 0) >= photos.length;
+}
+
+function manageListingCard(row, reload) {
+  const photos = [...row.listing_photos].sort((a, b) => a.position - b.position);
+  const title = listingTitle(row);
+  const details = h('div', { class: 'details', hidden: true },
+    h('div', { class: 'photos' }, photos.map((photo) => {
+      const url = photoUrl(photo.storage_path);
+      return h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, h('img', { src: url, alt: 'صورة العرض', loading: 'lazy' }));
+    })),
+    listingSpecs(row),
+    row.description ? h('p', { class: 'description' }, row.description) : null);
+
+  const setStatus = async (status, message) => {
+    await mustUpdate(db.from('listings').update({ status, reject_reason: null }).eq('id', row.id));
+    toast(message);
+    reload();
+  };
+
+  const visible = ['published', 'sold', 'rented'].includes(row.status);
+  const stats = [
+    `${number.format(row.view_count ?? 0)} مشاهدة`,
+    `${number.format(row.whatsapp_clicks ?? 0)} واتساب`,
+    `${number.format(row.call_clicks ?? 0)} اتصال`,
+  ].join(' · ');
+  const ends = row.status === 'published' && row.expires_at ? ` · ينتهي ${date.format(new Date(row.expires_at))}` : '';
+
+  return h('div', { class: 'card' },
+    h('div', { class: 'card-row' },
+      photos[0] ? h('img', { class: 'thumb', src: photoUrl(photos[0].storage_path), alt: '' }) : h('div', { class: 'thumb' }),
+      h('div', { class: 'card-text' },
+        h('div', { class: 'card-title' }, `${title} · ${dealLabel(row.deal)} · ${priceLine(row.price, row.currency, row.price_unit)}`),
+        h('div', { class: 'card-meta' }, `${ownerLine(row.profiles)} · `, phoneText(row.contact_phone), ends),
+        h('div', { class: 'card-meta' }, stats),
+        row.reject_reason ? h('div', { class: 'card-meta' }, `سبب الرفض: ${row.reject_reason}`) : null),
+      statusChip(row),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn', onClick: () => { details.hidden = !details.hidden; } }, 'التفاصيل'),
+        visible
+          ? actionButton('إخفاء', '', async () => {
+            if (await confirmDialog('إخفاء العرض', `«${title}» بيختفي من التطبيق، وصاحبو بيشوفو «مخفي». تقدر ترجّعو بعدين.`, 'إخفاء')) {
+              await setStatus('hidden', 'اتخفى من التطبيق');
+            }
+          })
+          : actionButton(row.status === 'rejected' ? 'قبول ونشر' : 'إظهار', 'dark',
+            () => setStatus('published', 'رجع ظاهر في التطبيق')),
+        actionButton('حذف', 'danger', async () => {
+          const ok = await confirmDialog('حذف العرض نهائياً',
+            `«${title}» بيتمسح مع صورو وبلاغاتو، وما بيرجع تاني.`, 'حذف نهائي');
+          if (!ok) return;
+          const filesGone = await deleteListing(row);
+          toast(filesGone ? 'العرض اتمسح مع صورو' : 'العرض اتمسح، لكن الصور لسه في التخزين: شغّل ملف SQL الأخير في Supabase');
+          reload();
+        }))),
+    details);
+}
+
+function manageRequestCard(row, reload) {
+  const title = `${row.item_types.name_ar} ${row.deal === 'sale' ? 'للشراء' : 'للإيجار'}`;
+  const setStatus = async (status, message) => {
+    await mustUpdate(db.from('buyer_requests').update({ status, reject_reason: null }).eq('id', row.id));
+    toast(message);
+    reload();
+  };
+  const visible = ['published', 'found'].includes(row.status);
+
+  return h('div', { class: 'card' },
+    h('div', { class: 'card-row' },
+      h('div', { class: 'card-text' },
+        h('div', { class: 'card-title' }, title),
+        h('div', { class: 'card-meta' }, `${ownerLine(row.profiles)} · ${row.cities.name_ar}، ولاية ${row.states.name_ar} · `, phoneText(row.contact_phone))),
+      statusChip(row),
+      h('div', { class: 'actions' },
+        visible
+          ? actionButton('إخفاء', '', async () => {
+            if (await confirmDialog('إخفاء الطلب', `«${title}» بيختفي من التطبيق. تقدر ترجّعو بعدين.`, 'إخفاء')) {
+              await setStatus('hidden', 'اتخفى من التطبيق');
+            }
+          })
+          : actionButton(row.status === 'rejected' ? 'قبول ونشر' : 'إظهار', 'dark',
+            () => setStatus('published', 'رجع ظاهر في التطبيق')),
+        actionButton('حذف', 'danger', async () => {
+          if (!await confirmDialog('حذف الطلب نهائياً', `«${title}» بيتمسح وما بيرجع تاني.`, 'حذف نهائي')) return;
+          await mustUpdate(db.from('buyer_requests').delete().eq('id', row.id));
+          toast('الطلب اتمسح');
+          reload();
+        }))),
+    h('p', { class: 'description' }, row.details));
+}
+
+async function manageTab(main) {
+  const reload = () => showPanel('manage');
+  const isListings = manageState.kind === 'listings';
+  const table = isListings ? 'listings' : 'buyer_requests';
+  const filters = isListings ? LISTING_FILTERS : REQUEST_FILTERS;
+  const active = filters.find(([key]) => key === manageState.filter) || filters[0];
+  const now = new Date().toISOString();
+
+  let query = db.from(table).select(isListings ? LISTING_QUERY : REQUEST_QUERY);
+  query = active[2](query, now);
+  const search = searchFilter(manageState.search, isListings ? ['brand', 'model', 'description'] : ['details']);
+  if (search) query = query.or(search);
+
+  const [rows, ...counts] = await Promise.all([
+    must(query.order('created_at', { ascending: false }).range(0, manageState.loaded - 1)),
+    ...filters.map(async ([, , apply]) => {
+      const { count: total, error } = await apply(db.from(table).select('id', { count: 'exact', head: true }), now);
+      if (error) throw error;
+      return total;
+    }),
+  ]);
+
+  const setState = (changes) => {
+    Object.assign(manageState, changes);
+    reload();
+  };
+
+  const kindButton = (kind, label) => h('button', {
+    class: `filter${manageState.kind === kind ? ' active' : ''}`,
+    onClick: () => setState({ kind, filter: 'live', search: '', loaded: PAGE_SIZE }),
+  }, label);
+
+  const searchBox = h('input', {
+    class: 'search',
+    type: 'search',
+    value: manageState.search,
+    placeholder: isListings ? 'ماركة، موديل، رقم، أو كلمة في الوصف' : 'رقم أو كلمة في التفاصيل',
+    'aria-label': 'بحث',
+  });
+  const searchForm = h('form', {
+    class: 'search-form',
+    onSubmit: (event) => {
+      event.preventDefault();
+      setState({ search: searchBox.value.trim(), loaded: PAGE_SIZE });
+    },
+  }, searchBox, h('button', { class: 'btn', type: 'submit' }, 'بحث'));
+
+  const render = isListings ? manageListingCard : manageRequestCard;
+
+  // replaceChildren بيكتب null كنص، فبنشيل الأجزاء الفاضية أول.
+  main.replaceChildren(...[
+    h('div', { class: 'title-row' }, h('h1', {}, 'إدارة المنشور'), searchForm),
+    h('p', { class: 'hint' }, 'كل العروض والطلبات بعد المراجعة: إخفاء، إرجاع، أو حذف نهائي.'),
+    h('div', { class: 'filters' }, kindButton('listings', 'العروض'), kindButton('requests', 'الطلبات')),
+    h('div', { class: 'filters' }, filters.map(([key, label], index) => h('button', {
+      class: `filter light${key === active[0] ? ' active' : ''}`,
+      onClick: () => setState({ filter: key, loaded: PAGE_SIZE }),
+    }, label, h('span', {}, number.format(counts[index] ?? 0))))),
+    manageState.search
+      ? h('p', { class: 'hint' }, `نتيجة البحث عن «${manageState.search}» `,
+        h('button', { class: 'btn link', onClick: () => setState({ search: '', loaded: PAGE_SIZE }) }, 'مسح البحث'))
+      : null,
+    h('section', {},
+      rows.length
+        ? rows.map((row) => render(row, reload))
+        : h('p', { class: 'empty' }, manageState.search ? 'ما لقينا حاجة.' : 'ما في حاجة هنا.')),
+    rows.length >= manageState.loaded
+      ? h('button', {
+        class: 'btn load-more',
+        onClick: () => setState({ loaded: manageState.loaded + PAGE_SIZE }),
+      }, 'عرض المزيد')
+      : null,
+  ].filter(Boolean));
+}
+
+/** الرقم بيتكتب من الشمال لليمين، عشان «+» ما تنقلب للآخر جوة النص العربي. */
+const phoneText = (phone) => h('span', { class: 'ltr', style: 'display:inline-block' }, phone);
 
 // ---------------------------------------------------------------- الشركات والإعدادات
 
